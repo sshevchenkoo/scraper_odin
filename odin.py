@@ -1,4 +1,6 @@
 import time
+import threading
+import sqlite3
 from datetime import datetime, timedelta
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -9,93 +11,157 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 
-# Настройки без интерфейса
 options = Options()
-options.add_argument("--headless")  # Убрать, если хотите видеть браузер
+options.add_argument("--headless=new")
 options.add_argument("--disable-gpu")
 options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 
-# Функция для фильтрации данных
+def initialize_db():
+    conn = sqlite3.connect("config.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS urls (
+            user_id TEXT PRIMARY KEY
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def delete_user_id_from_db(user_id):
+    try:
+        conn = sqlite3.connect("config.db")
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM urls WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+        print(f"[INFO] user_id '{user_id}' deleted.")
+    except Exception as e:
+        print("Error delete user_id from DB:", e)
+
+def add_user_id_to_db(user_id):
+    try:
+        conn = sqlite3.connect("config.db")
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO urls (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+        conn.close()
+        print(f"[INFO] Added user: {user_id}")
+    except Exception as e:
+        print("Error add user", e)
+
+def get_urls_from_db():
+    try:
+        conn = sqlite3.connect("config.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM urls")
+        user_ids = [row[0] for row in cursor.fetchall()]
+        conn.close()
+
+        base_url = "https://odin.fun/user/{}?tab=activity"
+        urls = [base_url.format(uid) for uid in user_ids]
+        return urls
+    except Exception as e:
+        print("Error DB", e)
+        return []
+
 def check_and_filter(driver):
     try:
-        # Ждем загрузку таблицы
         wait = WebDriverWait(driver, 10)
+        user_span = wait.until(EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'flex items-center gap-2')]//span")))
+        username = user_span.text.strip()
+
         tbody = wait.until(EC.presence_of_element_located((By.XPATH, "//tbody[contains(@class, 'border-0')]")))
-
-        # Получаем HTML содержимое и парсим с помощью BeautifulSoup
         soup = BeautifulSoup(tbody.get_attribute("outerHTML"), "html.parser")
-
-        # Находим первые 10 блоков <tr>
         rows = soup.find_all("tr", limit=10)
 
-        # Формат даты в HTML
         time_format = "%m/%d/%y %I:%M %p"
-
-        # Текущее время
         now = datetime.now()
 
-        # Фильтрация строк по дате
         valid_rows = []
+
         for row in rows:
-            # Ищем <span> с классом text-odin-primary
             date_span = row.find("span", class_="text-odin-primary")
             if date_span:
-                # Преобразуем текст даты в datetime
                 date_text = date_span.text.strip()
                 row_time = datetime.strptime(date_text, time_format)
 
-                # Проверяем, входит ли разница во временной интервал 5 минут
-                if now - row_time <= timedelta(minutes=60):
-                    soup = BeautifulSoup(str(row), "html.parser")
-                    # Извлекаем название токена
-                    token_span = soup.find("span", class_="font-bold uppercase")
-                    token_name = token_span.text.strip() if token_span else "UNKNOWN"
-                    # Извлекаем действие (BUY/SELL)
-                    action_span = soup.find_all("span", class_="text-odin-primary")
-                    action = action_span[1].text.strip() if len(action_span) > 1 else "UNKNOWN"
-                    # Извлекаем количество
-                    quantity_span = soup.find_all("span", class_="")
-                    quantity = quantity_span[0].text.strip() if quantity_span else "UNKNOWN"
-                    # Выводим в читаемом формате
-                    formatted_output = f"{token_name} {action} {quantity}"
-                    print(formatted_output)
-                    valid_rows.append(row)
+                if now - row_time <= timedelta(minutes=5):
+                    token_name = "UNKNOWN"
+                    action = "UNKNOWN"
+                    quantity = "UNKNOWN"
 
-        # Формируем HTML для отфильтрованных строк
-        valid_rows_html = "".join([str(row) for row in valid_rows])
+                    token_span = row.find("span", class_="font-bold uppercase")
+                    if token_span:
+                        token_name = token_span.text.strip()
 
-        # Сохраняем в файл
-        with open("filtered_output.html", "w", encoding="utf-8") as file:
-            file.write(valid_rows_html)
+                    action_spans = row.find_all("span", class_="text-odin-primary")
+                    if len(action_spans) > 1:
+                        action = action_spans[1].text.strip()
 
-        print(f"Проверка завершена. Найдено строк: {len(valid_rows)}")
+                    price_span = row.find("span", string=lambda text: text and "$" in text)
+                    if price_span:
+                        quantity = price_span.text.strip()
+
+                    formatted_output = f"{username} | {token_name} {action} {quantity}"
+                    valid_rows.append((username, token_name, action, quantity))
+
+        with open("filtered_output.txt", "a", encoding="utf-8") as file:
+            for row in valid_rows:
+                line = " | ".join(row)
+                file.write(line + "\n")
 
     except Exception as e:
-        print("Ошибка при обработке данных:", e)
+        print("Error", e)
 
-# Запуск браузера и постоянное обновление
-try:
-    # Запускаем браузер один раз
+def scraping_loop(stop_event):
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
 
-    # Загружаем страницу один раз
-    url = "https://odin.fun/user/zbbno-hxlzc-zqcxy-stoni-dnqrl-zbfdu-qo3bt-6xkww-mz6zl-bc6gy-lqe?tab=activity"
-    driver.get(url)
+    try:
+        while not stop_event.is_set():
+            urls = get_urls_from_db()
+            for url in urls:
+                driver.get(url)
+                check_and_filter(driver)
+            stop_event.wait(5 * 60)
+    finally:
+        driver.quit()
 
-    # Основной цикл проверки каждые 5 минут
+def menu():
+    stop_event = threading.Event()
+    scraper_thread = threading.Thread(target=scraping_loop, args=(stop_event,))
+    scraper_thread.start()
+
     while True:
-        check_and_filter(driver)
-        print("Ожидание 5 минут...")
-        time.sleep(5 * 60)  # Задержка в 5 минут
+        print("\n==== MENU ====")
+        print("1. ADD User user_id")
+        print("2. Show user_id")
+        print("3. Delete user_id")
+        print("4. Stop & exit")
+        choice = input("Input: ")
 
-except KeyboardInterrupt:
-    print("Программа остановлена пользователем.")
+        if choice == "1":
+            new_id = input("Write user_id: ").strip()
+            if new_id:
+                add_user_id_to_db(new_id)
+        elif choice == "2":
+            ids = get_urls_from_db()
+            print("ID:")
+            for url in ids:
+                print(" -", url)
+        elif choice == "3":
+            delete_id = input("Write user_id: ").strip()
+            if delete_id:
+                delete_user_id_from_db(delete_id)
+        elif choice == "4":
+            stop_event.set()
+            scraper_thread.join()
+            print("Exit.")
+            break
+        else:
+            print("Incorrect choice. Try again.")
 
-except Exception as e:
-    print("Ошибка:", e)
-
-finally:
-    # Закрываем браузер
-    driver.quit()
+if __name__ == "__main__":
+    initialize_db()
+    menu()
